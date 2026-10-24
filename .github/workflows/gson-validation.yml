@@ -1,0 +1,121 @@
+name: Validate Gson 2.15.0
+
+on:
+  push:
+    branches:
+      - codex/validate-gson-2.15.0
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: 26d4084268d5fd982fedc22979ef3d585a9f928f
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the exact PR candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: '14742923'
+          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+      - name: Reproduce pinned native inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          git rev-parse HEAD | tee validation/candidate.txt
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C AndroidLibXrayLite rev-parse HEAD)" = '76a6e2172210613fcb4aa32b6de55bcd9452ce43'
+          test "$(git -C AndroidLibXrayLite describe --tags --exact-match)" = 'v26.10.21'
+          echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=0 --install 'ndk;30.0.16248370'
+          export NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370"
+          bash compile-hevtun.sh 2>&1 | tee validation/native.log
+          mkdir -p V2rayNG/app/libs
+          cp -r libs/. V2rayNG/app/libs/
+          gh release download v26.10.21 --repo 2dust/AndroidLibXrayLite --pattern libv2ray.aar --dir V2rayNG/app/libs
+          echo 'e56ec3b06485fe7b37af26948673951edf719c50d6bbc618b8539045952adde4  V2rayNG/app/libs/libv2ray.aar' | sha256sum --check
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > V2rayNG/local.properties
+
+      - name: Run targeted JSON compatibility checks
+        working-directory: V2rayNG
+        run: |
+          set -euo pipefail
+          bash ./gradlew :app:testPlaystoreDebugUnitTest --rerun --tests com.v2ray.ang.util.JsonUtilTest --tests com.v2ray.ang.dto.TranslatorsParserTest --no-daemon --console=plain --no-build-cache 2>&1 | tee ../validation/targeted.log
+          mkdir -p ../validation/targeted-results
+          cp app/build/test-results/testPlaystoreDebugUnitTest/TEST-*.xml ../validation/targeted-results/
+
+      - name: Run both full suites and build both distributions
+        working-directory: V2rayNG
+        run: |
+          set -euo pipefail
+          bash ./gradlew :app:testPlaystoreDebugUnitTest --rerun :app:testFdroidDebugUnitTest --rerun :app:compilePlaystoreDebugKotlin --rerun :app:compileFdroidDebugKotlin --rerun :app:assemblePlaystoreDebug :app:assembleFdroidDebug :app:licenseFdroidReleaseReport --no-daemon --console=plain --no-build-cache 2>&1 | tee ../validation/full.log
+          bash ./gradlew :app:dependencyInsight --dependency com.google.code.gson:gson --configuration playstoreDebugRuntimeClasspath --no-daemon --console=plain 2>&1 | tee ../validation/dependency.log
+
+      - name: Check executed counts and packaged native ABIs
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, xml.etree.ElementTree as ET, zipfile
+          root = pathlib.Path('.')
+          lines = ['Candidate: ' + os.environ['CANDIDATE_SHA']]
+          paths = [('targeted', root / 'validation/targeted-results', 4), ('Play Store', root / 'V2rayNG/app/build/test-results/testPlaystoreDebugUnitTest', 116), ('F-Droid', root / 'V2rayNG/app/build/test-results/testFdroidDebugUnitTest', 116)]
+          for name, directory, expected in paths:
+              totals = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+              for path in directory.glob('TEST-*.xml'):
+                  suite = ET.parse(path).getroot()
+                  for key in totals:
+                      totals[key] += int(suite.get(key, '0'))
+              assert totals == dict(tests=expected, failures=0, errors=0, skipped=0), (name, totals)
+              lines.append(name + ': ' + str(totals))
+          abis = {'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'}
+          for flavor in ('playstore', 'fdroid'):
+              apks = list((root / ('V2rayNG/app/build/outputs/apk/' + flavor + '/debug')).glob('*.apk'))
+              assert len(apks) == 5, (flavor, len(apks))
+              found = set()
+              for apk in apks:
+                  with zipfile.ZipFile(apk) as archive:
+                      names = set(archive.namelist())
+                      for abi in abis:
+                          prefix = 'lib/' + abi + '/'
+                          if any(name.startswith(prefix) for name in names):
+                              for library in ('libgojni.so', 'libhev-socks5-tunnel.so', 'libhevsockstun.so'):
+                                  assert prefix + library in names, (apk, abi, library)
+                              found.add(abi)
+                  lines.append(apk.name + ' SHA256=' + hashlib.sha256(apk.read_bytes()).hexdigest())
+              assert found == abis, (flavor, found)
+          text = '\n'.join(lines) + '\n'
+          print(text)
+          (root / 'validation/summary.txt').write_text(text)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(text)
+          PY
+          git diff --exit-code
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gson-2.15.0-linux-validation
+          retention-days: 7
+          path: |
+            validation/
+            V2rayNG/app/build/test-results/
+            V2rayNG/app/build/reports/tests/
+            libs/
