@@ -106,7 +106,9 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write(text)
           PY
-          git diff --exit-code
+          # The required license task regenerates this tracked build input.
+          git diff --name-only > validation/generated-files.txt
+          git diff --exit-code -- . ':(exclude)V2rayNG/app/src/main/assets/open_source_licenses.html'
 
       - name: Upload validation evidence
         if: always()
