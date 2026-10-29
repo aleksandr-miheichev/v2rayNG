@@ -1,0 +1,289 @@
+name: Validate AGP 9.5.0
+
+on:
+  push:
+    branches:
+      - codex/validate-agp-9.5.0
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ddbf15bd2663121437721105273bb628e374fd38
+  MIN_UNIT_TESTS: '124'
+  NATIVE_SHA: 76a6e2172210613fcb4aa32b6de55bcd9452ce43
+  NATIVE_TAG: v26.10.21
+  NATIVE_AAR_SHA256: e56ec3b06485fe7b37af26948673951edf719c50d6bbc618b8539045952adde4
+  NDK_VERSION: 30.0.16248370
+  BUILD_TOOLS_VERSION: 37.0.0
+
+jobs:
+  validate:
+    if: github.repository == 'aleksandr-miheichev/v2rayNG'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout the exact PR candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: '14742923'
+          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+      - name: Record candidate provenance and reproduce pinned native inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git ls-tree HEAD AndroidLibXrayLite | awk '{print $3}')" = "$NATIVE_SHA"
+          test "$(git -C AndroidLibXrayLite rev-parse HEAD)" = "$NATIVE_SHA"
+          test "$(git -C AndroidLibXrayLite describe --tags --exact-match)" = "$NATIVE_TAG"
+          git diff --exit-code
+          git rev-parse HEAD > validation/candidate.txt
+          git status --porcelain=v1 > validation/initial-status.txt
+          git submodule status --recursive > validation/submodules.txt
+          git ls-tree HEAD V2rayNG/gradle/libs.versions.toml V2rayNG/app/build.gradle.kts V2rayNG/gradle.properties V2rayNG/gradle/wrapper/gradle-wrapper.properties compile-hevtun.sh > validation/source-inputs.txt
+          java -version 2> validation/java-version.txt
+          uname -a > validation/runner.txt
+          cat /etc/os-release >> validation/runner.txt
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=0 --install "ndk;$NDK_VERSION"
+          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          cat "$NDK_HOME/source.properties" > validation/ndk-version.txt
+          bash compile-hevtun.sh 2>&1 | tee validation/native.log
+          mkdir -p V2rayNG/app/libs
+          cp -r libs/. V2rayNG/app/libs/
+          gh release download "$NATIVE_TAG" --repo 2dust/AndroidLibXrayLite --pattern libv2ray.aar --dir V2rayNG/app/libs
+          printf '%s  %s\n' "$NATIVE_AAR_SHA256" V2rayNG/app/libs/libv2ray.aar | sha256sum --check
+          sha256sum V2rayNG/app/libs/libv2ray.aar libs/*/*.so > validation/native-inputs.sha256
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > V2rayNG/local.properties
+
+      - name: Regenerate the F-Droid license report
+        working-directory: V2rayNG
+        run: |
+          set -euo pipefail
+          bash ./gradlew --version --no-daemon --console=plain 2>&1 | tee ../validation/gradle-version.txt
+          bash ./gradlew :app:licenseFdroidReleaseReport --rerun-tasks --no-daemon --console=plain --no-build-cache 2>&1 | tee ../validation/licenses.log
+
+      - name: Execute both full unit suites and assemble debug and unsigned release APKs
+        working-directory: V2rayNG
+        run: |
+          set -euo pipefail
+          bash ./gradlew \
+            :app:testPlaystoreDebugUnitTest \
+            :app:testFdroidDebugUnitTest \
+            :app:compilePlaystoreDebugKotlin \
+            :app:compileFdroidDebugKotlin \
+            :app:compilePlaystoreReleaseKotlin \
+            :app:compileFdroidReleaseKotlin \
+            :app:assemblePlaystoreDebug \
+            :app:assembleFdroidDebug \
+            :app:assemblePlaystoreRelease \
+            :app:assembleFdroidRelease \
+            --rerun-tasks --no-daemon --console=plain --no-build-cache 2>&1 | tee ../validation/full.log
+
+      - name: Verify executed tests, output metadata, APK manifests, and native ABIs
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import xml.etree.ElementTree as ET
+          import zipfile
+
+          root = Path.cwd()
+          evidence = root / "validation"
+          build = root / "V2rayNG/app/build"
+          build_tools = Path(os.environ["ANDROID_HOME"]) / "build-tools" / os.environ["BUILD_TOOLS_VERSION"]
+          abis = {"arm64-v8a", "armeabi-v7a", "x86", "x86_64"}
+          fdroid_offsets = {"universal": 0, "arm64-v8a": 1, "armeabi-v7a": 2, "x86_64": 3, "x86": 4}
+          elf_headers = {"armeabi-v7a": (1, 40), "arm64-v8a": (2, 183), "x86": (1, 3), "x86_64": (2, 62)}
+          required_libraries = ("libgojni.so", "libhev-socks5-tunnel.so", "libhevsockstun.so")
+          version_name = "2.3.14"
+          base_version_code = 754
+          minimum_tests = int(os.environ["MIN_UNIT_TESTS"])
+          summary = ["Candidate: " + os.environ["CANDIDATE_SHA"]]
+          report = {
+              "candidate_sha": os.environ["CANDIDATE_SHA"],
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "native_revision": os.environ["NATIVE_SHA"],
+              "native_tag": os.environ["NATIVE_TAG"],
+              "aar_sha256": os.environ["NATIVE_AAR_SHA256"],
+              "ndk_version": os.environ["NDK_VERSION"],
+              "build_tools_version": os.environ["BUILD_TOOLS_VERSION"],
+              "expected_agp": "9.5.0",
+              "expected_version_name": version_name,
+              "expected_base_version_code": base_version_code,
+              "tests": {},
+              "apks": [],
+          }
+
+          def require(condition, details):
+              if not condition:
+                  raise RuntimeError(str(details))
+
+          def digest(stream):
+              sha = hashlib.sha256()
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  sha.update(chunk)
+              return sha.hexdigest()
+
+          catalog = (root / "V2rayNG/gradle/libs.versions.toml").read_text()
+          require(re.search(r'^agp\s*=\s*"9\.5\.0"\s*$', catalog, re.MULTILINE), "AGP must be 9.5.0")
+          gradle = (root / "V2rayNG/app/build.gradle.kts").read_text()
+          require(re.search(r'^\s*versionCode\s*=\s*754\s*$', gradle, re.MULTILINE), "Unexpected source versionCode")
+          require(re.search(r'^\s*versionName\s*=\s*"2\.3\.14"\s*$', gradle, re.MULTILINE), "Unexpected source versionName")
+          full_log = (evidence / "full.log").read_text()
+          test_names = {}
+          for flavor in ("playstore", "fdroid"):
+              task = "test" + flavor.capitalize() + "DebugUnitTest"
+              require(re.search(r"^> Task :app:" + task + r"\s*$", full_log, re.MULTILINE), (task, "Task did not execute"))
+              xml_files = sorted((build / "test-results" / task).glob("TEST-*.xml"))
+              require(xml_files, (task, "No XML test reports"))
+              totals = dict.fromkeys(("tests", "failures", "errors", "skipped"), 0)
+              names = []
+              for path in xml_files:
+                  suite = ET.parse(path).getroot()
+                  require(suite.tag == "testsuite", (path, suite.tag))
+                  cases = suite.findall("testcase")
+                  require(int(suite.get("tests", "0")) == len(cases), (path, "Header/testcase count mismatch"))
+                  for key in totals:
+                      totals[key] += int(suite.get(key, "0"))
+                  for case in cases:
+                      require(not any(case.find(key) is not None for key in ("failure", "error", "skipped")), (path, case.attrib))
+                      require(case.get("classname") and case.get("name"), (path, "Missing test identity"))
+                      names.append(case.get("classname") + "::" + case.get("name"))
+              require(totals["tests"] >= minimum_tests, (task, totals, minimum_tests))
+              require(all(totals[key] == 0 for key in ("failures", "errors", "skipped")), (task, totals))
+              require(len(names) == len(set(names)), (task, "Duplicate test identities"))
+              test_names[flavor] = set(names)
+              report["tests"][flavor] = {"totals": totals, "xml_files": len(xml_files), "test_names": sorted(names)}
+              summary.append(flavor + ": " + str(totals))
+          require(test_names["playstore"] == test_names["fdroid"], "Flavors executed different test sets")
+
+          for flavor in ("playstore", "fdroid"):
+              application_id = "com.v2ray.ang" + (".fdroid" if flavor == "fdroid" else "")
+              for build_type in ("debug", "release"):
+                  directory = build / "outputs/apk" / flavor / build_type
+                  metadata_path = directory / "output-metadata.json"
+                  metadata = json.loads(metadata_path.read_text())
+                  require(metadata.get("applicationId") == application_id, (metadata_path, "Wrong application ID"))
+                  require(metadata.get("variantName") == flavor + build_type.capitalize(), (metadata_path, "Wrong variant"))
+                  elements = metadata["elements"]
+                  require(len(elements) == 5, (metadata_path, len(elements)))
+                  require(len(list(directory.glob("*.apk"))) == 5, (directory, "Expected exactly five APKs"))
+                  seen_abis = set()
+                  seen_files = set()
+                  for element in elements:
+                      filters = element["filters"]
+                      require(len(filters) <= 1 and all(item.get("filterType") == "ABI" for item in filters), (metadata_path, filters))
+                      abi = filters[0]["value"] if filters else "universal"
+                      require(abi in abis | {"universal"} and abi not in seen_abis, (metadata_path, abi))
+                      seen_abis.add(abi)
+                      expected_code = 5000000 + 100 * base_version_code + fdroid_offsets[abi] if flavor == "fdroid" else 4000000 + base_version_code
+                      expected_name = "v2rayNG_" + version_name + ("-fdroid" if flavor == "fdroid" else "") + "_" + abi + ".apk"
+                      require(element["outputFile"] == expected_name, (metadata_path, element["outputFile"], expected_name))
+                      require(element["versionCode"] == expected_code, (metadata_path, abi, element["versionCode"], expected_code))
+                      require(element["versionName"] == version_name, (metadata_path, abi, element["versionName"]))
+                      require(element["outputFile"] not in seen_files, (metadata_path, "Duplicate outputFile"))
+                      seen_files.add(element["outputFile"])
+                      apk = directory / element["outputFile"]
+                      require(apk.is_file() and apk.stat().st_size > 0, (apk, "Missing or empty APK"))
+                      expected_abis = abis if abi == "universal" else {abi}
+                      native_files = {}
+                      with zipfile.ZipFile(apk) as archive:
+                          names = set(archive.namelist())
+                          packaged_abis = {name.split("/")[1] for name in names if name.startswith("lib/") and name.count("/") >= 2}
+                          require(packaged_abis == expected_abis, (apk, packaged_abis, expected_abis))
+                          require("AndroidManifest.xml" in names and "classes.dex" in names, (apk, "Missing manifest or bytecode"))
+                          for packaged_abi in sorted(expected_abis):
+                              for library in required_libraries:
+                                  member = "lib/" + packaged_abi + "/" + library
+                                  require(member in names, (apk, member))
+                                  with archive.open(member) as stream:
+                                      header = stream.read(20)
+                                  require(len(header) == 20 and header[:4] == b"\x7fELF", (apk, member, "Not ELF"))
+                                  expected_class, expected_machine = elf_headers[packaged_abi]
+                                  require(header[4] == expected_class and header[5] == 1 and int.from_bytes(header[18:20], "little") == expected_machine, (apk, member, "Wrong ELF architecture"))
+                                  with archive.open(member) as stream:
+                                      native_files[member] = {"size": archive.getinfo(member).file_size, "sha256": digest(stream)}
+                      badging = subprocess.check_output([str(build_tools / "aapt2"), "dump", "badging", str(apk)], text=True)
+                      artifact_prefix = flavor + "-" + build_type + "-" + abi
+                      (evidence / (artifact_prefix + "-badging.txt")).write_text(badging)
+                      package_line = next((line for line in badging.splitlines() if line.startswith("package:")), "")
+                      package = dict(re.findall(r"(\w+)='([^']*)'", package_line))
+                      require(package.get("name") == application_id, (apk, package))
+                      require(package.get("versionCode") == str(expected_code), (apk, package))
+                      require(package.get("versionName") == version_name, (apk, package))
+                      native_line = next((line for line in badging.splitlines() if line.startswith("native-code:")), "")
+                      require(set(re.findall(r"'([^']+)'", native_line)) == expected_abis, (apk, native_line))
+                      signing = subprocess.run([str(build_tools / "apksigner"), "verify", "--verbose", str(apk)], capture_output=True, text=True)
+                      (evidence / (artifact_prefix + "-signing.txt")).write_text(signing.stdout + signing.stderr)
+                      require((signing.returncode == 0) == (build_type == "debug"), (apk, "Unexpected signing state", signing.returncode))
+                      with apk.open("rb") as stream:
+                          apk_sha256 = digest(stream)
+                      report["apks"].append({
+                          "flavor": flavor,
+                          "build_type": build_type,
+                          "abi": abi,
+                          "file": str(apk.relative_to(root)),
+                          "size": apk.stat().st_size,
+                          "sha256": apk_sha256,
+                          "application_id": application_id,
+                          "version_code": expected_code,
+                          "version_name": version_name,
+                          "native_files": native_files,
+                          "signature_verified": signing.returncode == 0,
+                      })
+                  require(seen_abis == abis | {"universal"}, (metadata_path, seen_abis))
+                  summary.append(flavor + " " + build_type + ": 5 APKs; ABI, filename, version, manifest, native ELF and signing checks passed")
+          require(len(report["apks"]) == 20, "Expected twenty verified APKs")
+          (evidence / "apk-manifest.json").write_text(json.dumps(report, indent=2) + "\n")
+          text = "\n".join(summary) + "\n"
+          (evidence / "summary.txt").write_text(text)
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+              stream.write("~~~text\n" + text + "~~~\n")
+          PY
+
+      - name: Check generated source changes
+        run: |
+          set -euo pipefail
+          git diff --name-only > validation/generated-files.txt
+          # The license task intentionally regenerates this tracked asset.
+          git diff --exit-code -- . ':(exclude)V2rayNG/app/src/main/assets/open_source_licenses.html'
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agp-9.5.0-linux-validation
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            validation/
+            V2rayNG/app/build/test-results/
+            V2rayNG/app/build/reports/tests/
+            V2rayNG/app/build/outputs/apk/**/output-metadata.json
+            V2rayNG/app/src/main/assets/open_source_licenses.html
